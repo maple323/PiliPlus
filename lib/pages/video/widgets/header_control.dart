@@ -1165,6 +1165,119 @@ class HeaderControlState extends State<HeaderControl>
     );
   }
 
+  /// 取某条字幕在指定格式下的文本内容，失败返回 null。
+  ///
+  /// vtt 直接复用播放器已加载的文本；srt/txt 由同一份接口 JSON 现场转换，
+  /// 所以保存和复制拿到的一定是同源内容。json 是原始接口响应，按字节返回。
+  Future<({String? text, Uint8List? bytes})?> _subtitleContent({
+    required Subtitle item,
+    required int index,
+    required SubtitleFormat format,
+  }) async {
+    final url = item.subtitleUrl;
+    if (url == null || url.isEmpty) return null;
+    try {
+      if (format == .json) {
+        final res = await Request.dio.get<Uint8List>(
+          url.http2https,
+          options: Options(
+            responseType: .bytes,
+            headers: Constants.baseHeaders,
+            extra: {'account': const NoAccount()},
+          ),
+        );
+        if (res.statusCode != 200) return null;
+        return (
+          text: null,
+          bytes: Uint8List.fromList(
+            Request.responseBytesDecoder(res.data!, res.headers.map),
+          ),
+        );
+      }
+      var text = format == .vtt ? videoDetailCtr.vttSubtitles[index]?.id : null;
+      if (text == null) {
+        text = await VideoHttp.getSubtitles(url, format: format);
+        if (text == null) return null;
+        if (format == .vtt) {
+          videoDetailCtr.vttSubtitles[index] = (isData: true, id: text);
+        }
+      }
+      return (text: text, bytes: null);
+    } catch (e, s) {
+      Utils.reportError(e, s);
+      SmartDialog.showToast(e.toString());
+      return null;
+    }
+  }
+
+  /// 字幕保存/复制菜单，按当前选中格式给出一条字幕的两个动作
+  void _onSubtitleMenu(
+    BuildContext parentContext,
+    Subtitle item,
+    SubtitleFormat format,
+    int index,
+  ) {
+    showModalBottomSheet<void>(
+      context: parentContext,
+      builder: (sheetContext) {
+        Future<void> run({required bool toClipboard}) async {
+          Get.back();
+          final content = await _subtitleContent(
+            item: item,
+            index: index,
+            format: format,
+          );
+          if (content == null) return;
+          if (toClipboard) {
+            final text = content.text;
+            if (text != null) {
+              Utils.copyText(text);
+            } else if (content.bytes != null) {
+              // JSON 是原始响应体，按项目既有编码器还原成文本
+              Utils.copyText(
+                utf8.decode(content.bytes!, allowMalformed: true),
+              );
+            }
+            return;
+          }
+          final videoDetail = introController.videoDetail.value;
+          final name =
+              '${videoDetail.title}-${videoDetail.owner?.name}(${videoDetail.owner?.mid})-${videoDetailCtr.bvid}-${videoDetailCtr.cid.value}-${item.lanDoc}.${format.name}'
+                  .replaceAll(
+                    Platform.isWindows ? RegExp(r'[<>:/\\|?*"]') : '/',
+                    '_',
+                  );
+          // Reserved characters may not be used in file names. See: https://docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file#naming-conventions
+          StorageUtils.saveBytes2File(
+            name: name,
+            bytes: content.bytes ?? utf8.encode(content.text!),
+            allowedExtensions: [format.name],
+          );
+        }
+
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                dense: true,
+                leading: const Icon(Icons.save_alt, size: 20),
+                title: const Text('保存文件'),
+                onTap: () => run(toClipboard: false),
+              ),
+              ListTile(
+                dense: true,
+                leading: const Icon(Icons.copy_all_outlined, size: 20),
+                title: const Text('复制到剪贴板'),
+                onTap: () => run(toClipboard: true),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   void onExportSubtitle() {
     showDialog(
       context: context,
@@ -1222,69 +1335,21 @@ class HeaderControlState extends State<HeaderControl>
           ),
           children: List.generate(subtitles.length, (i) {
             final item = subtitles[i];
+            final rawText = format == .vtt
+                ? videoDetailCtr.vttSubtitles[i]?.id
+                : null;
+            // 已加载的字幕文本不需要再请求，菜单上就直接标出来
+            final loaded = switch (format) {
+              .vtt => rawText != null,
+              .srt || .txt => item.subtitleUrl != null && item.subtitleUrl!.isNotEmpty,
+              .json => true,
+            };
             return DialogOption(
-              onPressed: () async {
-                Get.back();
-                final url = item.subtitleUrl;
-                if (url == null || url.isEmpty) return;
-                try {
-                  final Uint8List bytes;
-                  switch (format) {
-                    case .vtt || .srt || .txt:
-                      var subtitle = format == .vtt
-                          ? videoDetailCtr.vttSubtitles[i]?.id
-                          : null;
-                      if (subtitle == null) {
-                        final res = await VideoHttp.getSubtitles(
-                          item.subtitleUrl!,
-                          format: format,
-                        );
-                        if (res == null) return;
-                        subtitle = res;
-                        if (format == .vtt) {
-                          videoDetailCtr.vttSubtitles[i] = (
-                            isData: true,
-                            id: res,
-                          );
-                        }
-                      }
-                      bytes = utf8.encode(subtitle);
-                    case .json:
-                      final res = await Request.dio.get<Uint8List>(
-                        url.http2https,
-                        options: Options(
-                          responseType: .bytes,
-                          headers: Constants.baseHeaders,
-                          extra: {'account': const NoAccount()},
-                        ),
-                      );
-                      if (res.statusCode != 200) return;
-                      bytes = Uint8List.fromList(
-                        Request.responseBytesDecoder(
-                          res.data!,
-                          res.headers.map,
-                        ),
-                      );
-                  }
-                  final videoDetail = introController.videoDetail.value;
-                  final name =
-                      '${videoDetail.title}-${videoDetail.owner?.name}(${videoDetail.owner?.mid})-${videoDetailCtr.bvid}-${videoDetailCtr.cid.value}-${item.lanDoc}.${format.name}'
-                          .replaceAll(
-                            Platform.isWindows ? RegExp(r'[<>:/\\|?*"]') : '/',
-                            '_',
-                          );
-                  // Reserved characters may not be used in file names. See: https://docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file#naming-conventions
-                  StorageUtils.saveBytes2File(
-                    name: name,
-                    bytes: bytes,
-                    allowedExtensions: [format.name],
-                  );
-                } catch (e, s) {
-                  Utils.reportError(e, s);
-                  SmartDialog.showToast(e.toString());
-                }
-              },
-              child: Text(item.lanDoc ?? item.lan),
+              onPressed: () => loaded ? _onSubtitleMenu(context, item, format, i)
+                  : null,
+              child: Text(
+                '${item.lanDoc ?? item.lan}${loaded ? '' : '（需先加载字幕）'}',
+              ),
             );
           }),
         );
