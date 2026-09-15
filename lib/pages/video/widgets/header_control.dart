@@ -1335,20 +1335,15 @@ class HeaderControlState extends State<HeaderControl>
           ),
           children: List.generate(subtitles.length, (i) {
             final item = subtitles[i];
-            final rawText = format == .vtt
-                ? videoDetailCtr.vttSubtitles[i]?.id
-                : null;
-            // 已加载的字幕文本不需要再请求，菜单上就直接标出来
-            final loaded = switch (format) {
-              .vtt => rawText != null,
-              .srt || .txt => item.subtitleUrl != null && item.subtitleUrl!.isNotEmpty,
-              .json => true,
-            };
+            // 只要接口给了地址就能取到内容：vtt 缓存为空时 _subtitleContent
+            // 会自己发请求，不依赖播放器预先加载过该轨道
+            final hasUrl = item.subtitleUrl?.isNotEmpty ?? false;
             return DialogOption(
-              onPressed: () => loaded ? _onSubtitleMenu(context, item, format, i)
+              onPressed: hasUrl
+                  ? () => _onSubtitleMenu(context, item, format, i)
                   : null,
               child: Text(
-                '${item.lanDoc ?? item.lan}${loaded ? '' : '（需先加载字幕）'}',
+                '${item.lanDoc ?? item.lan}${hasUrl ? '' : '（无字幕地址）'}',
               ),
             );
           }),

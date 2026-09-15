@@ -55,7 +55,12 @@ class _CommentExportDialogState extends State<CommentExportDialog> {
   late final CommentCrawlState _state;
   late String _status;
   bool _running = false;
+
+  /// 用户主动停止（可继续）
   bool _stopped = false;
+
+  /// 已抓到末页，本轮结束
+  bool _completed = false;
   int _lastTick = 0;
 
   @override
@@ -90,6 +95,12 @@ class _CommentExportDialogState extends State<CommentExportDialog> {
 
   void _copy() => Utils.copyText(_buildText());
 
+  Future<void> _save() => StorageUtils.saveBytes2File(
+    name: '${widget.fileName}.${_format.name}',
+    bytes: utf8.encode(_buildText()),
+    allowedExtensions: [_format.name],
+  );
+
   Future<void> _start() async {
     // 运行中再点一次 = 停止，让正在跑的那次去收尾
     if (_running) {
@@ -99,6 +110,7 @@ class _CommentExportDialogState extends State<CommentExportDialog> {
     setState(() {
       _running = true;
       _stopped = false;
+      _completed = false;
       _status = '正在抓取...';
     });
     final watch = Stopwatch()..start();
@@ -118,19 +130,20 @@ class _CommentExportDialogState extends State<CommentExportDialog> {
         },
       );
       if (!mounted) return;
-      GStorage.localCache.delete(_resumeKey);
+      // 抓完不自动落盘，由用户决定复制还是保存；中途停止则留断点待续爬
       final stopped = _stopped;
-      await StorageUtils.saveBytes2File(
-        name: '${widget.fileName}.${_format.name}',
-        bytes: utf8.encode(_buildText()),
-        allowedExtensions: [_format.name],
-      );
-      if (!mounted) return;
+      if (stopped) {
+        _saveCheckpoint();
+      } else {
+        _completed = true;
+        GStorage.localCache.delete(_resumeKey);
+      }
       setState(() {
         _status = stopped
-            ? '已停止：导出前 ${_state.comments.length} 条评论'
-            : '导出完成：共 ${_state.comments.length} 条评论，'
-                  '耗时 ${watch.elapsed.inSeconds} 秒';
+            ? '已暂停：已抓 ${_state.comments.length} 条，'
+                  '可复制或保存，也可继续抓取'
+            : '抓取完成：共 ${_state.comments.length} 条评论，'
+                  '耗时 ${watch.elapsed.inSeconds} 秒，可复制或保存';
       });
     } on CommentCrawlException catch (e) {
       _saveCheckpoint();
@@ -195,19 +208,35 @@ class _CommentExportDialogState extends State<CommentExportDialog> {
             _status,
             style: TextStyle(fontSize: 12, color: secondary),
           ),
-          TextButton.icon(
-            // 抓取中不给复制，避免复制到半截数据
-            onPressed: running || _state.comments.isEmpty ? null : _copy,
-            icon: const Icon(Icons.copy_all_outlined, size: 16),
-            label: const Text(
-              '复制到剪贴板',
-              style: TextStyle(fontSize: 13),
+          if (!running && _state.comments.isNotEmpty)
+            Row(
+              children: [
+                TextButton.icon(
+                  onPressed: _copy,
+                  icon: const Icon(Icons.copy_all_outlined, size: 16),
+                  label: const Text(
+                    '复制到剪贴板',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                  style: TextButton.styleFrom(
+                    minimumSize: const Size(0, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: _save,
+                  icon: const Icon(Icons.save_alt, size: 16),
+                  label: const Text(
+                    '保存文件',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                  style: TextButton.styleFrom(
+                    minimumSize: const Size(0, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                ),
+              ],
             ),
-            style: TextButton.styleFrom(
-              minimumSize: const Size(0, 32),
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-            ),
-          ),
         ],
       ),
       actions: [
@@ -215,16 +244,17 @@ class _CommentExportDialogState extends State<CommentExportDialog> {
           onPressed: running ? null : Get.back,
           child: Text('关闭', style: TextStyle(color: colorScheme.outline)),
         ),
-        TextButton(
-          onPressed: _start,
-          child: Text(
-            running
-                ? '停止并导出'
-                : _state.comments.isEmpty
-                ? '开始抓取'
-                : '继续抓取',
+        if (running)
+          TextButton(
+            onPressed: _start,
+            child: const Text('停止'),
+          )
+        else if (!_completed)
+          TextButton(
+            onPressed: _start,
+            child: Text(_state.comments.isEmpty ? '开始抓取' : '继续抓取'),
           ),
-        ),
+        // 已抓到末页就不再提供继续
       ],
     );
   }
