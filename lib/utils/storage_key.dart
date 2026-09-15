@@ -250,7 +250,7 @@ abstract final class LocalCacheKey {
       timeStamp = 'timeStamp',
       buvid = 'buvid';
 
-  /// 评论导出断点：完整 key 为 commentExport_<oid>
+  /// 评论导出断点：完整 key 为 `commentExport_<oid>`
   static const String commentExportPrefix = 'commentExport_';
 }
 
