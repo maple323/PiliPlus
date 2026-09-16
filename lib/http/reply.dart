@@ -269,10 +269,20 @@ abstract final class ReplyHttp {
   /// 翻页间隔，过快容易触发风控
   static const Duration _crawlInterval = Duration(milliseconds: 500);
 
+  /// 楼中楼并发数。主楼必须按游标串行，但同一页各主楼下的楼中楼互不
+  /// 依赖，可以并发取；这个值直接决定抓取总耗时，别调太高以免触发风控。
+  static const int _subConcurrency = 6;
+
   /// 全量抓取视频评论（主楼 + 楼中楼），实现对齐 Web 端脚本：
   /// - 主楼优先走 wbi/main 游标翻页，auto 模式首轮探测失败自动回退旧接口并固定该模式
   /// - 楼中楼仅在 rcount > 0 时按 ps=20 翻页，单条失败不阻断整次抓取
   /// - 每页间隔 500ms，每 5 页回调 [onCheckpoint]，供外部落盘断点
+  ///
+  /// 全部请求都带 [options]（即 [NoAccount]）。**这一步不能省**：抓取走的是
+  /// REST wbi 接口，而客户端在 [AnonymousAccount] 下会挂一个本地伪造的 buvid3
+  /// （见 `IdUtils.genBuvid3`）。服务端判定该 cookie 非法后，会在第 1 页就返回
+  /// `is_end=true`（实测只剩 3 条），使抓取只拿到一页。app 自身评论页走 gRPC，
+  /// 不经过此 cookie，所以不受影响。
   ///
   /// 抓到的评论累加进 [state.comments]，取消或异常时保留已抓到的部分。
   static Future<void> crawlComments({
@@ -289,23 +299,56 @@ abstract final class ReplyHttp {
       while (true) {
         if (cancelled()) return;
         final page = await _fetchReplyMain(oid: oid, type: type, state: state);
+        // 先收本页主楼，再并发取楼中楼：主楼按游标串行，楼中楼同页内
+        // 互不依赖，是并行度能吃满的部分
+        final pending = <({int root, int slot})>[];
         for (final item in page.replies) {
           final record = item.toCommentRecord();
           if (record != null) state.comments.add(record);
           final rpid = item.rpid;
           if ((item.rcount ?? 0) > 0 && rpid != null) {
-            state.comments.addAll(
-              await _fetchSubReplies(
-                oid: oid,
-                root: rpid,
-                type: type,
-                cancelled: cancelled,
-                onProgress: onProgress,
-              ),
-            );
+            pending.add((root: rpid, slot: state.comments.length));
           }
-          onProgress?.call();
         }
+
+        if (pending.isNotEmpty) {
+          final fetched = List<List<CommentRecord>?>.filled(
+            pending.length,
+            null,
+          );
+          // 有界并发：固定 _subConcurrency 个 worker 从队列里取任务
+          var next = 0;
+          CommentCrawlException? risk;
+          final workers = List.generate(_subConcurrency, (_) async {
+            while (true) {
+              if (cancelled() || risk != null) return;
+              final i = next++;
+              if (i >= pending.length) return;
+              try {
+                fetched[i] = await _fetchSubReplies(
+                  oid: oid,
+                  root: pending[i].root,
+                  type: type,
+                  cancelled: cancelled,
+                );
+                onProgress?.call();
+              } on CommentCrawlException catch (e) {
+                // 风控要终止整次抓取，其它错误只丢这一条
+                if (e.isRiskControl) risk = e;
+              }
+            }
+          });
+          await Future.wait(workers);
+          if (risk case final e?) throw e;
+
+          // 并发结果按本页顺序回填，保证导出内容稳定可复现
+          for (var i = pending.length - 1; i >= 0; i--) {
+            final list = fetched[i];
+            if (list == null || list.isEmpty) continue;
+            state.comments.insertAll(pending[i].slot, list);
+          }
+        }
+
         if (page.isEnd || page.replies.isEmpty) return;
         state.cursor = page.next;
         if (++pageNo % 5 == 0) onCheckpoint?.call(state);
@@ -341,6 +384,7 @@ abstract final class ReplyHttp {
             'web_location': 1315875,
             'pagination_str': jsonEncode({'offset': state.cursor}),
           }),
+          options: options,
         );
         final code = res.data['code'];
         if (code == 0) {
@@ -380,6 +424,7 @@ abstract final class ReplyHttp {
         'ps': 20,
         'next': int.tryParse(state.cursor) ?? 0,
       },
+      options: options,
     );
     final code = res.data['code'];
     if (code != 0) {
@@ -399,7 +444,6 @@ abstract final class ReplyHttp {
     required int root,
     required int type,
     required bool Function() cancelled,
-    void Function()? onProgress,
   }) async {
     final list = <CommentRecord>[];
     var page = 1;
@@ -414,6 +458,7 @@ abstract final class ReplyHttp {
           'ps': 20,
           'pn': page,
         },
+        options: options,
       );
       final code = res.data['code'];
       if (_riskCodes.contains(code)) {
@@ -426,10 +471,7 @@ abstract final class ReplyHttp {
       if (replies == null || replies.isEmpty) return list;
       for (final item in replies) {
         final record = item.toCommentRecord(isSub: true);
-        if (record != null) {
-          list.add(record);
-          onProgress?.call();
-        }
+        if (record != null) list.add(record);
       }
       if (page * 20 >= (data.page?.count ?? 0)) return list;
       page++;

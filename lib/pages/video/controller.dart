@@ -1162,9 +1162,15 @@ class VideoDetailController extends GetxController
         } catch (_) {}
       }
 
-      if (response.subtitle?.subtitles case final sub? when (sub.isNotEmpty)) {
-        _setSubtitle(sub);
-      } else if (!Accounts.main.isLogin) {
+      final restSubs = response.subtitle?.subtitles;
+      if (restSubs != null && restSubs.isNotEmpty) {
+        _setSubtitle(restSubs);
+      } else {
+        // REST 的 player/v2 拿不到字幕时用 gRPC 兜底，**不再区分登录态**。
+        // 原先只在未登录时兜底，导致登录后一旦 REST 返回空（付费/充电
+        // 专属视频、或被限制的字幕）就直接没有字幕列表，反而比匿名拿得少。
+        // gRPC DmView 在匿名下也会返回 AI 字幕及其直链。
+        // 这是尽力而为：失败就不显示字幕，不打扰用户。
         final res = await DmGrpc.dmView(aid, cid.value);
         if (res case Success(:final response)) {
           if (response.hasSubtitle() &&
@@ -1186,8 +1192,6 @@ class VideoDetailController extends GetxController
                 ..sort(),
             );
           }
-        } else {
-          res.toast();
         }
       }
     }

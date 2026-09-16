@@ -1,10 +1,8 @@
-import 'dart:convert' show jsonDecode, jsonEncode, utf8;
+import 'dart:convert' show utf8;
 
 import 'package:PiliPlus/common/style.dart';
-import 'package:PiliPlus/http/reply.dart';
+import 'package:PiliPlus/utils/comment_crawl.dart';
 import 'package:PiliPlus/utils/comment_utils.dart';
-import 'package:PiliPlus/utils/storage.dart';
-import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:PiliPlus/utils/storage_utils.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:get/get.dart';
@@ -12,8 +10,8 @@ import 'package:material_ui/material_ui.dart';
 
 /// 导出某个评论对象（视频 aid / 课程 epId）的全部评论，含楼中楼。
 ///
-/// 热门视频评论量可达上万条，抓取要跑几分钟，所以弹窗内带进度和停止；
-/// 触发风控或中途失败时断点落盘，下次打开同一页面可接着爬。
+/// 真正的抓取跑在 [CommentCrawlManager] 的后台任务里，与这个弹窗无关：
+/// 关掉弹窗、点空白处、返回上一页，抓取都继续。重新打开会挂回同一任务。
 Future<void> showCommentExportDialog(
   BuildContext context, {
   required int oid,
@@ -51,47 +49,34 @@ class CommentExportDialog extends StatefulWidget {
 
 class _CommentExportDialogState extends State<CommentExportDialog> {
   CommentExportFormat _format = CommentExportFormat.txt;
-  late final String _resumeKey;
-  late final CommentCrawlState _state;
-  late String _status;
-  bool _running = false;
-
-  /// 用户主动停止（可继续）
-  bool _stopped = false;
-
-  /// 已抓到末页，本轮结束
-  bool _completed = false;
-  int _lastTick = 0;
+  late final CommentCrawlTask _task;
 
   @override
   void initState() {
     super.initState();
-    _resumeKey = '${LocalCacheKey.commentExportPrefix}${widget.oid}';
-    _state = _restore();
-    _status = _state.comments.isEmpty
-        ? '将抓取全部评论（含楼中楼），预计需要一会儿'
-        : '检测到上次未完成的抓取，已恢复 ${_state.comments.length} 条，可继续';
+    _task = CommentCrawlManager.taskFor(
+      oid: widget.oid,
+      type: widget.type,
+      fileName: widget.fileName,
+    );
+    _task.addListener(_onTaskChanged);
   }
 
-  CommentCrawlState _restore() {
-    final saved = GStorage.localCache.get(_resumeKey);
-    if (saved is String) {
-      try {
-        return CommentCrawlState.fromJson(
-          jsonDecode(saved) as Map<String, dynamic>,
-        );
-      } catch (_) {}
-    }
-    return CommentCrawlState();
+  @override
+  void dispose() {
+    // 只退订，不停任务：抓取继续在后台跑
+    _task.removeListener(_onTaskChanged);
+    super.dispose();
   }
 
-  void _saveCheckpoint() =>
-      GStorage.localCache.put(_resumeKey, jsonEncode(_state.toJson()));
+  void _onTaskChanged() {
+    if (mounted) setState(() {});
+  }
 
   /// 按当前选中的格式生成文本，复制和落盘共用
   String _buildText() => _format == CommentExportFormat.csv
-      ? CommentUtils.toCsv(_state.comments)
-      : CommentUtils.toTxt(_state.comments);
+      ? CommentUtils.toCsv(_task.state.comments)
+      : CommentUtils.toTxt(_task.state.comments);
 
   void _copy() => Utils.copyText(_buildText());
 
@@ -101,73 +86,11 @@ class _CommentExportDialogState extends State<CommentExportDialog> {
     allowedExtensions: [_format.name],
   );
 
-  Future<void> _start() async {
-    // 运行中再点一次 = 停止，让正在跑的那次去收尾
-    if (_running) {
-      setState(() => _stopped = true);
-      return;
-    }
-    setState(() {
-      _running = true;
-      _stopped = false;
-      _completed = false;
-      _status = '正在抓取...';
-    });
-    final watch = Stopwatch()..start();
-    try {
-      await ReplyHttp.crawlComments(
-        oid: widget.oid,
-        type: widget.type,
-        state: _state,
-        isCancelled: () => _stopped,
-        onCheckpoint: (_) => _saveCheckpoint(),
-        onProgress: () {
-          // 回调很密，限到约 5 次/秒，避免整棵树频繁重建
-          final ms = watch.elapsedMilliseconds;
-          if (ms - _lastTick < 200 || !mounted) return;
-          _lastTick = ms;
-          setState(() => _status = '正在抓取...已获取 ${_state.comments.length} 条');
-        },
-      );
-      if (!mounted) return;
-      // 抓完不自动落盘，由用户决定复制还是保存；中途停止则留断点待续爬
-      final stopped = _stopped;
-      if (stopped) {
-        _saveCheckpoint();
-      } else {
-        _completed = true;
-        GStorage.localCache.delete(_resumeKey);
-      }
-      setState(() {
-        _status = stopped
-            ? '已暂停：已抓 ${_state.comments.length} 条，'
-                  '可复制或保存，也可继续抓取'
-            : '抓取完成：共 ${_state.comments.length} 条评论，'
-                  '耗时 ${watch.elapsed.inSeconds} 秒，可复制或保存';
-      });
-    } on CommentCrawlException catch (e) {
-      _saveCheckpoint();
-      if (!mounted) return;
-      setState(() {
-        _status = e.isRiskControl
-            ? '触发B站风控：${e.message}\n'
-                  '已抓 ${_state.comments.length} 条，断点已保存，稍后点"继续抓取"可续爬'
-            : '抓取失败：${e.message}';
-      });
-    } catch (e) {
-      _saveCheckpoint();
-      if (!mounted) return;
-      setState(() => _status = '抓取失败：$e\n断点已保存，稍后点"继续抓取"可续爬');
-    } finally {
-      if (mounted) setState(() => _running = false);
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final colorScheme = ColorScheme.of(context);
     final secondary = colorScheme.secondary;
-    final running = _running;
+    final running = _task.running;
     return AlertDialog(
       clipBehavior: Clip.hardEdge,
       constraints: Style.dialogFixedConstraints,
@@ -205,10 +128,18 @@ class _CommentExportDialogState extends State<CommentExportDialog> {
           ),
           const SizedBox(height: 6),
           Text(
-            _status,
+            _task.statusText,
             style: TextStyle(fontSize: 12, color: secondary),
           ),
-          if (!running && _state.comments.isNotEmpty)
+          if (running)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '关闭此窗口不会中断抓取，可稍后回来查看',
+                style: TextStyle(fontSize: 11, color: colorScheme.outline),
+              ),
+            ),
+          if (!running && _task.hasResult)
             Row(
               children: [
                 TextButton.icon(
@@ -241,20 +172,25 @@ class _CommentExportDialogState extends State<CommentExportDialog> {
       ),
       actions: [
         TextButton(
-          onPressed: running ? null : Get.back,
+          onPressed: Get.back,
           child: Text('关闭', style: TextStyle(color: colorScheme.outline)),
         ),
-        if (running)
+        // 已抓到末页：结果会一直保留，可复制/保存，也可清掉重抓
+        if (_task.finished)
           TextButton(
-            onPressed: _start,
-            child: const Text('停止'),
+            onPressed: () {
+              _task.reset();
+              _task.start();
+            },
+            child: const Text('重新抓取'),
           )
-        else if (!_completed)
+        else if (running)
+          TextButton(onPressed: _task.stop, child: const Text('停止'))
+        else
           TextButton(
-            onPressed: _start,
-            child: Text(_state.comments.isEmpty ? '开始抓取' : '继续抓取'),
+            onPressed: _task.start,
+            child: Text(_task.hasResult ? '继续抓取' : '开始抓取'),
           ),
-        // 已抓到末页就不再提供继续
       ],
     );
   }
