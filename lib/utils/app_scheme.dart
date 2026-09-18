@@ -142,9 +142,10 @@ abstract final class PiliScheme {
               return true;
             }
             return false;
-          case 'video':
+          case 'video' || 'story':
             // bilibili://video/12345678?dm_progress=123000&cid=12345678&dmid=12345678
             // bilibili://video/{aid}/?comment_root_id=***&comment_secondary_id=***
+            // bilibili://story/{aid}?cid=xxxx&player_height=xxxx（首页推荐位下发）
             final queryParameters = uri.queryParameters;
             if (queryParameters['comment_root_id'] != null) {
               // to video reply
